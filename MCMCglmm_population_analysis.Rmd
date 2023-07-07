@@ -1,0 +1,327 @@
+---
+title: "Chinstrap Population Mixed Model"
+author: "Lucas Krüger"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r echo=FALSE}
+### data processing 
+library(reshape2)
+library(plyr)
+library(dplyr)
+library(tidyverse)
+
+#plots
+library(ggplot2)
+library(patchwork)
+library(sjPlot)
+
+#models
+library(energy)
+library(lmerTest)
+library(optimx)
+library(minqa)
+library(dfoptim)
+library(MCMCglmm)
+
+```
+
+#Humphries et al. (2017) Mapping Application for 
+#Penguin Populations and Projected Dynamics (MAPPPD): 
+#data and tools for dynamic management and decision support
+# Polar Record 53 (269): 160–166 doi:10.1017/S0032247417000055
+
+```{r, echo=TRUE}
+# data from MAPPPD for area 48.1: 
+
+
+df<-read.csv("D:/ChinstrapMadness/AllCounts_V_4_0.csv") 
+
+
+summary(as.factor(df$common_name))
+
+chins<-subset(df,common_name=="chinstrap penguin") # subset chinstrap penguin
+
+summary(as.factor(chins$common_name))
+summary(as.factor(chins$count_type))
+
+nests<-subset(chins,count_type=="nests")
+
+nestM<-ddply(na.omit(data.frame(nests)), c("season_starting","site_id"), summarise,
+             nests=max(penguin_count),
+             Lat=mean(latitude_epsg_4326),
+             Lon=mean(longitude_epsg_4326))  ### some poppulations had multiple counts oiver the same season
+                                             ### this summarises the count with the maximum nests
+
+
+
+
+####### this is for summarizing number of populations and number of counts
+
+
+countsN<-ddply(nestM, c("site_id","Lat","Lon"), summarise,
+              ncounts=length(nests),
+              interval=(max(season_starting)-min(season_starting)))
+
+
+countsN2<-ddply(subset(nestM,nests>0), c("site_id","Lat","Lon"), summarise,
+               ncounts=length(nests),
+               interval=(max(season_starting)-min(season_starting)))
+
+countsN2
+
+summary(as.factor(countsN2$ncounts))
+
+npops=length(countsN2$ncounts[countsN2$ncounts>1])
+npops
+
+
+
+head(nestM)
+
+nestM2<-merge(nestM,countsN) # identify number of counts for each population by merging
+
+
+poisson.mtest(nestM2$nests[nestM2$ncounts>2 & nestM2$nests>0],R=199)  ##test for poisson distribution
+
+nestm3<-subset(nestM2,ncounts>2 & nests>0) # subset only populations with at least 3 counts and with any nest recorded
+
+summary(as.factor(nestm3$site_id)) # for some reason it is keeping two pops with 1 count
+
+nestm3<-subset(nestm3,site_id!="KAYR" & site_id!="PETE")
+
+
+ggplot(nestm3,aes(season_starting,(nests)))+
+  geom_point(alpha=0.2)+
+  theme_bw()+xlim(1960,2020)+facet_wrap(site_id~.)
+  
+
+
+
+```
+
+
+```{r, echo=FALSE}
+
+###------- changes in population size -----------------
+
+###------- changes in population size -----------------
+
+nestM3<-nestm3
+alpha.V= diag(40^2, 2, 2)
+summary(as.factor(nestM3$site_id))
+
+
+
+prior<- list(R = list(V = 1, nu = 0.002),
+             G = list(G1 = list(V = diag(2), nu = 0.002,
+                                alpha.mu = rep(0, 2),
+                                alpha.V= diag(2, 2, 2))))
+nestM3$Zss<-scale(nestM3$season_starting)
+
+
+nestM4<-subset(nestM3,site_id!="HARM")
+
+
+mc1<-MCMCglmm(nests~season_starting, random=~us(1 + Zss):site_id, rcov=~units, family="poisson", mev=NULL,
+         data=nestM4,start=NULL,  nodes="ALL",  scale=TRUE, nitt=13000, thin=10, burnin=3000, pr=T,
+         pl=FALSE, verbose=TRUE, DIC=TRUE, singular.ok=FALSE, saveX=TRUE,prior=prior,
+         saveZ=TRUE, saveXL=TRUE, slice=FALSE, ginverse=NULL, trunc=FALSE)
+
+
+summary(mc1)
+
+#plot(mc1$Sol)
+
+plot(mc1$VCV)
+
+
+sol<-data.frame(mc1$Sol) # random effects
+
+tail(sol)
+
+solm<-melt(sol,id.vars=c("X.Intercept.","season_starting"))
+
+
+solm$vars<-substring(solm$variable,first=1,last=3)
+
+solm<-subset(solm,vars=="Zss")
+
+solm$site_id<-substring(solm$variable,first=13,last=16)
+
+head(solm)
+
+ranef<-ddply(solm, c("site_id"), summarise,
+             slp=mean(value),slsd=sd(value),
+             slse=slsd/sqrt(length(value)-1))
+
+rpop<-ddply(nestM4, c("site_id"), summarise,
+             Lat=mean(Lat),Lon=mean(Lon))
+
+rlat<-merge(ranef,rpop,by="site_id")
+
+
+years<-data.frame(season_starting=c(1960:2020)) # construct an hypothetical dataframe to generate the populations estimates
+
+
+pops<-data.frame(site_id=countsN2$site_id[countsN2$ncounts>1],Lat=countsN2$Lat[countsN2$ncounts>1])
+
+popy<-merge(pops,years)
+popy$nests<-c(0)   ### MCMCglmm needs a column with the response variable
+
+head(popy)
+
+popy$Zss<-scale(popy$season_starting)
+popypred<-data.frame(predict(mc1,newdata=popy,type="response",marginal=mc1$Random$formula,interval="prediction",
+                  posterior="mean"))
+
+popy$fit<-popypred$fit
+
+#figure 3
+
+
+p1v2<-ggplot(popy,aes(season_starting,fit/1000))+geom_smooth()+
+  geom_point(alpha=0.15)+xlab("Year")+
+  theme_bw()+ylab("Thousand nests")+
+  ggtitle(label="a. Predicted count of nests")+scale_y_log10() # plot from the predicted fit
+
+p1v2
+
+p2<-    ggplot(subset(rlat,Lat>(-67)),aes(Lat,slp))+
+  geom_hline(yintercept=0,linetype="dashed")+
+  stat_smooth(method="gam",formula=y~s(x,k=2))+
+  geom_errorbar(aes(ymin=slp-(slsd),ymax=slp+(slsd)),alpha=0.5)+
+  geom_point(alpha=0.5)+
+  theme_bw()+
+  ggtitle(label="b. Random effect")+
+  ylab("Slope")+xlim(-66,-60)+
+  xlab("Latitude")
+
+
+p1v2/p2
+
+
+
+```
+
+# population change in generation time
+```{r}
+
+
+###-------- based in the MCMCglmm---------------------
+
+### ps: as results are based on randomization, expect slight differences everytime you run the model
+### but the trends are consistent everytime
+###  lagged analysis to determine how much pops have decreased
+
+
+
+library(lubridate)
+library(tidyr)
+library(tidyquant)
+library(dplyr)
+library(broom)
+library(purrr)
+library(stringr)
+library(knitr)
+library(timetk)
+
+popT<-ddply(popy, c("season_starting"), summarise,
+            tot=sum(fit),    ### total population  
+            mean=mean(fit))  ### mean population
+summary(popy)
+
+
+#colony level change
+
+popy$TS<-(as.POSIXct(strptime(paste(popy$season_starting,c("01-01"),sep="-"), 
+                              format="%Y-%m-%d" ,tz="GMT")) )   # create a time stamp for year
+
+
+mts1<-xts(popy$fit,order.by=c(popy$TS)) # create a temporal data frame
+
+m1lag<-((data.frame(year=popy$season_starting,id=popy$site_id,mts1 %>%           
+                     lag.xts(k = c(0,27,28,29,30)))))# create a lagged data frame
+
+m1lag$ch3<-(m1lag$lag0/m1lag$lag27)-1
+m1lag$ch4<-(m1lag$lag0/m1lag$lag28)-1
+m1lag$ch5<-(m1lag$lag0/m1lag$lag29)-1
+m1lag$ch6<-(m1lag$lag0/m1lag$lag30)-1
+tail(m1lag)
+
+m1lags<-data.frame(year=m1lag$year,id=m1lag$id,m1lag[8:11])
+
+chm1<-na.omit(melt(m1lags,id.vars=c("year","id")))
+
+summary(chm1$value)
+
+quantile(chm1$value,probs=0.75)
+quantile(chm1$value,probs=0.05)
+
+mean(chm1$value)
+sd(chm1$value)
+
+# population level change
+
+
+popT$TS<-(as.POSIXct(strptime(paste(popT$season_starting,c("01-01"),sep="-"), 
+                              format="%Y-%m-%d" ,tz="GMT")) )   # create a time stamp for year
+
+popy$TS<-(as.POSIXct(strptime(paste(popy$season_starting,c("01-01"),sep="-"), 
+                              format="%Y-%m-%d" ,tz="GMT")) )   # create a time stamp for year
+
+
+mts<-xts(popT$tot,order.by=popT$TS) # create a temporal data frame
+
+mlag<-((data.frame(year=popT$season_starting,mts %>%           
+                            lag.xts(k = c(0,27,28,29,30)))))# create a lagged data frame
+
+
+### proportional change for all lags
+
+mlag$ch3<-(mlag$lag0/mlag$lag27)-1
+mlag$ch4<-(mlag$lag0/mlag$lag28)-1
+mlag$ch5<-(mlag$lag0/mlag$lag29)-1
+mlag$ch6<-(mlag$lag0/mlag$lag30)-1
+tail(mlag)
+mlags<-data.frame(year=mlag$year,mlag[7:10])
+
+
+chm<-na.omit(melt(mlags,id.vars="year"))
+chm
+
+summary(chm$value)
+
+quantile(chm$value,probs=0.75)
+quantile(chm$value,probs=0.05)
+
+mean(chm$value)
+sd(chm$value)
+
+
+
+head(chm1)
+
+
+ggplot(chm,aes(value*100))+geom_histogram(aes(y = ..density..),
+                                      colour = 1, fill = "white") +
+  geom_density(lwd = 1.2,
+               linetype = 2,
+               colour = 2)+
+  theme_bw()+
+  xlab("Population size percent change")+
+  ggtitle(label=" Population change in three generations")
+
+
+```
